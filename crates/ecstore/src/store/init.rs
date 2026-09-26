@@ -5769,6 +5769,185 @@ mod tests {
 
     #[test]
     #[serial_test::serial(storage_class_env)]
+    fn data_movement_replaces_stale_unversioned_target_copy_under_if_match() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("build data movement test runtime");
+                runtime.block_on(async move {
+                    let temp_dir = tempfile::tempdir().expect("create data movement store dir");
+                    let (_ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "data-movement-stale-target-replacement",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("data-movement-stale-target-{}", uuid::Uuid::new_v4());
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create data movement bucket");
+                    // Pool 0 is the pool being drained. Marking it as decommissioning
+                    // makes target selection skip it, exactly as during a real
+                    // decommission, so the write is aimed at the pool holding the
+                    // stale copy rather than at the newer source copy itself.
+                    store
+                        .pool_meta
+                        .write()
+                        .await
+                        .decommission(0, crate::core::pools::PoolSpaceInfo { free: 0, total: 0, used: 0 })
+                        .expect("mark the source pool as decommissioning");
+                    // The target pool holds an OLDER copy of the unversioned object
+                    // (bucket metadata rewritten after a pool was added looks like
+                    // this): reads resolve the newer source copy, but the stale one
+                    // trips the data movement `If-None-Match: *` guard.
+                    let target_mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+                    let source_mod_time = target_mod_time + time::Duration::SECOND;
+
+                    let object = "stale-target-object";
+                    let stale_body = b"older copy left on the target pool".to_vec();
+                    let mut stale_reader = PutObjReader::from_vec(stale_body.clone());
+                    let stale_info = store.pools[1]
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut stale_reader,
+                            &ObjectOptions {
+                                mod_time: Some(target_mod_time),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write the older target copy");
+                    let stale_etag = stale_info.etag.clone().expect("the stale copy carries an etag");
+
+                    let source_body = b"newer source body that must replace the stale copy".to_vec();
+                    let seed = |body: Vec<u8>| DataMovementSourceSeed {
+                        pool_idx: 0,
+                        version_id: None,
+                        body,
+                        multipart_split: None,
+                        mod_time: source_mod_time,
+                        user_defined: HashMap::new(),
+                    };
+
+                    // Without the replacement guard the migration is rejected, and the
+                    // rejection is a precondition failure the decommission loop can act on.
+                    let source_reader =
+                        seed_data_movement_source_reader(&store, &bucket, object, seed(source_body.clone())).await;
+                    let source_info = source_reader.object_info.clone();
+                    let err = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader,
+                        None,
+                        "test_data_movement",
+                    )
+                    .await
+                    .expect_err("an older target copy must not be silently accepted as converged");
+                    assert!(
+                        matches!(
+                            crate::data_movement::data_movement_stage_source(&err),
+                            Some(StorageError::PreconditionFailed)
+                        ),
+                        "expected a wrapped precondition failure, got {err:?}"
+                    );
+
+                    // The lookup the decommission loop performs finds the stale copy
+                    // and hands back its etag.
+                    let overwrite_etag =
+                        crate::data_movement::stale_unversioned_target_overwrite_etag(&store, 0, &bucket, &source_info)
+                            .await
+                            .expect("inspect the target pools")
+                            .expect("the older target copy must be recognised as stale");
+                    assert_eq!(overwrite_etag, stale_etag);
+
+                    // A guard that no longer matches the target must still be rejected.
+                    let source_reader =
+                        seed_data_movement_source_reader(&store, &bucket, object, seed(source_body.clone())).await;
+                    let err = crate::data_movement::migrate_object_replacing_stale_target(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader,
+                        "test_data_movement",
+                        "\"not-the-stale-etag\"".to_string(),
+                    )
+                    .await
+                    .expect_err("a mismatched If-Match guard must not overwrite the target");
+                    assert!(
+                        matches!(
+                            crate::data_movement::data_movement_stage_source(&err),
+                            Some(StorageError::PreconditionFailed)
+                        ),
+                        "expected a wrapped precondition failure, got {err:?}"
+                    );
+                    let mut reader = store.pools[1]
+                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("read the untouched target copy");
+                    let mut body = Vec::new();
+                    reader.stream.read_to_end(&mut body).await.expect("drain the untouched target copy");
+                    assert_eq!(body, stale_body, "a rejected replacement must leave the stale copy intact");
+
+                    // With the stale copy's etag the source replaces it.
+                    let source_reader =
+                        seed_data_movement_source_reader(&store, &bucket, object, seed(source_body.clone())).await;
+                    crate::data_movement::migrate_object_replacing_stale_target(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader,
+                        "test_data_movement",
+                        overwrite_etag,
+                    )
+                    .await
+                    .expect("the newer source must replace the stale target copy");
+
+                    let mut reader = store.pools[1]
+                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("read the replaced target copy");
+                    let mut body = Vec::new();
+                    reader.stream.read_to_end(&mut body).await.expect("drain the replaced target copy");
+                    assert_eq!(body, source_body);
+                    let replaced = store.pools[1]
+                        .get_object_info(&bucket, object, &ObjectOptions::default())
+                        .await
+                        .expect("stat the replaced target copy");
+                    assert_eq!(replaced.mod_time, Some(source_mod_time));
+                    assert_ne!(replaced.etag.as_deref(), Some(stale_etag.as_str()));
+
+                    // The stale copy is gone for good: nothing is left for the
+                    // `If-None-Match: *` guard to trip over on a re-run.
+                    let source_reader =
+                        seed_data_movement_source_reader(&store, &bucket, object, seed(source_body.clone())).await;
+                    crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader,
+                        None,
+                        "test_data_movement",
+                    )
+                    .await
+                    .expect("an equivalent target copy converges the re-run");
+                });
+            })
+            .expect("spawn data movement test thread")
+            .join()
+            .expect("join data movement test thread");
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
     fn data_movement_multipart_replaces_only_unlocked_owned_generation() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
