@@ -4436,6 +4436,13 @@ enum DecommissionEntryOutcome {
     Deferred(Error),
 }
 
+/// Whether a migration attempt died on the target write's precondition, either
+/// as the raw error or wrapped by a data movement stage error.
+fn is_decommission_target_precondition_failure(err: &Error) -> bool {
+    matches!(err, Error::PreconditionFailed)
+        || matches!(data_movement::data_movement_stage_source(err), Some(Error::PreconditionFailed))
+}
+
 /// Decide what a terminal entry-attempt failure means for the current round.
 ///
 /// Target-gate and capacity-intent contention is a property of the target pool,
@@ -15547,6 +15554,10 @@ impl ECStore {
             let mut version_attempt = 1;
             let mut target_busy_attempt: usize = 0;
             let mut target_permit = None;
+            // Set once the target is found to hold an older unversioned copy of
+            // this object: the retried write replaces it under `If-Match`.
+            let mut stale_target_overwrite: Option<String> = None;
+            let mut stale_target_checked = false;
             while version_attempt <= DECOMMISSION_VERSION_COPY_ATTEMPTS {
                 if version_attempt > 1 || target_busy_attempt > 0 {
                     record_decommission_object_attempt(attempts);
@@ -15737,6 +15748,7 @@ impl ECStore {
 
                 let bucket_name = bucket.clone();
                 let object_name = rd.object_info.name.clone();
+                let source_info = rd.object_info.clone();
 
                 self.track_decommission_entry_progress_stage(
                     idx,
@@ -15750,7 +15762,14 @@ impl ECStore {
                 let migrate_result = self
                     .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                         self.clone()
-                            .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id, capacity_owner)
+                            .decommission_object(
+                                idx,
+                                bucket,
+                                rd,
+                                expected_bucket_incarnation_id,
+                                capacity_owner,
+                                stale_target_overwrite.clone(),
+                            )
                             .await
                     })
                     .await;
@@ -15804,6 +15823,54 @@ impl ECStore {
                             object_name.as_str(),
                             err,
                         ));
+                    }
+
+                    // A target write rejected by its `If-None-Match: *` guard
+                    // usually means the target already holds a stale copy of
+                    // this unversioned object. Replace it instead of failing
+                    // the entry; the retry does not consume a copy attempt.
+                    if !stale_target_checked && is_decommission_target_precondition_failure(&err) {
+                        stale_target_checked = true;
+                        match data_movement::stale_unversioned_target_overwrite_etag(
+                            self.as_ref(),
+                            idx,
+                            bucket_name.as_str(),
+                            &source_info,
+                        )
+                        .await
+                        {
+                            Ok(Some(etag)) => {
+                                warn!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "stale_target_overwrite",
+                                    pool_index = idx,
+                                    bucket = %bucket_name,
+                                    object = %object_name,
+                                    version = %version.name,
+                                    target_etag = %etag,
+                                    "Decommission target holds an older copy of the object; retrying the write as an If-Match replacement"
+                                );
+                                stale_target_overwrite = Some(etag);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(lookup_err) => {
+                                warn!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "stale_target_lookup_failed",
+                                    pool_index = idx,
+                                    bucket = %bucket_name,
+                                    object = %object_name,
+                                    version = %version.name,
+                                    error = ?lookup_err,
+                                    "Decommission could not inspect the target copy after a precondition failure"
+                                );
+                            }
+                        }
                     }
 
                     failure = true;
@@ -18975,11 +19042,12 @@ impl ECStore {
         rd: GetObjectReader,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         capacity_owner: Option<DecommissionCapacityOwner>,
+        stale_target_overwrite: Option<String>,
     ) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
         let mut migration = tokio::task::JoinSet::new();
-        migration.spawn(data_movement::migrate_decommission_object(
+        migration.spawn(data_movement::migrate_decommission_object_with_stale_target_overwrite(
             self,
             pool_idx,
             bucket.clone(),
@@ -18987,6 +19055,7 @@ impl ECStore {
             expected_bucket_incarnation_id,
             "decommission_object",
             capacity_owner,
+            stale_target_overwrite,
         ));
         let result = migration
             .join_next()

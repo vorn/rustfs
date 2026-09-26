@@ -1002,6 +1002,62 @@ fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: 
             .is_some_and(|(source_time, target_time)| target_time > source_time)
 }
 
+/// A target that already holds an *older* unversioned copy of the object a data
+/// movement is placing.
+///
+/// Reads resolve the newest copy across pools, so such a copy is unreachable, but
+/// it still trips the `If-None-Match: *` guard every data movement target write
+/// carries. Left alone, the newer source can never leave its pool (bucket
+/// metadata under `.rustfs.sys/buckets/` ends up like this whenever it was
+/// rewritten after a second pool was added). The source must replace the stale
+/// copy, guarded by that copy's etag so a concurrent writer is still detected.
+pub(crate) fn is_stale_unversioned_data_movement_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    is_unversioned_data_movement_object(source)
+        && is_unversioned_data_movement_object(target)
+        && !source.delete_marker
+        && !target.delete_marker
+        && target.etag.as_deref().is_some_and(|etag| !etag.is_empty())
+        && source
+            .mod_time
+            .zip(target.mod_time)
+            .is_some_and(|(source_time, target_time)| source_time > target_time)
+}
+
+/// Find a stale copy of `source` (see [`is_stale_unversioned_data_movement_target`])
+/// on any pool other than `src_pool_idx` and return the etag a retried target
+/// write must match to replace it.
+pub(crate) async fn stale_unversioned_target_overwrite_etag(
+    store: &ECStore,
+    src_pool_idx: usize,
+    bucket: &str,
+    source: &ObjectInfo,
+) -> Result<Option<String>> {
+    let suspended = {
+        let pool_meta = store.pool_meta.read().await;
+        (0..store.pools.len()).map(|idx| pool_meta.is_suspended(idx)).collect::<Vec<_>>()
+    };
+    for (target_pool_idx, is_suspended) in suspended.into_iter().enumerate() {
+        if target_pool_idx == src_pool_idx || is_suspended {
+            continue;
+        }
+        if let Some(target) = find_data_movement_target_info(store, target_pool_idx, bucket, source).await?
+            && is_stale_unversioned_data_movement_target(source, &target)
+        {
+            return Ok(target.etag);
+        }
+    }
+    Ok(None)
+}
+
+/// The guard for a target write that replaces a stale copy: it must still be
+/// exactly the copy that was inspected.
+pub(crate) fn data_movement_stale_target_overwrite_precondition(etag: &str) -> HTTPPreconditions {
+    HTTPPreconditions {
+        if_match: Some(etag.to_string()),
+        ..Default::default()
+    }
+}
+
 fn is_data_movement_upload_takeover_target(source: &ObjectInfo, target: &ObjectInfo, compare_part_checksums: bool) -> bool {
     let identity = data_movement_upload_identity(source);
     source.mod_time.is_some()
@@ -1563,6 +1619,7 @@ fn data_movement_part_upload_failure_stage(err: &Error) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn migrate_decommission_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -1571,6 +1628,34 @@ pub(crate) async fn migrate_decommission_object(
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
     capacity_owner: Option<DecommissionCapacityOwner>,
+) -> Result<()> {
+    migrate_decommission_object_with_stale_target_overwrite(
+        store,
+        pool_idx,
+        bucket,
+        rd,
+        source_bucket_incarnation_id,
+        op_label,
+        capacity_owner,
+        None,
+    )
+    .await
+}
+
+/// [`migrate_decommission_object`] whose target write replaces a stale copy
+/// under `If-Match: <stale_target_overwrite>` (see
+/// [`stale_unversioned_target_overwrite_etag`]) instead of requiring an absent
+/// target.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn migrate_decommission_object_with_stale_target_overwrite(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    source_bucket_incarnation_id: Option<uuid::Uuid>,
+    op_label: &str,
+    capacity_owner: Option<DecommissionCapacityOwner>,
+    stale_target_overwrite: Option<String>,
 ) -> Result<()> {
     let source = rd.object_info.clone();
     let mutation_fence = store
@@ -1593,8 +1678,23 @@ pub(crate) async fn migrate_decommission_object(
         None,
         capacity_owner,
         Some(mutation_fence),
+        stale_target_overwrite,
     )
     .await
+}
+
+/// Test entry point for the stale-target replacement path: the target write is
+/// guarded by `If-Match: <stale_target_etag>` instead of `If-None-Match: *`.
+#[cfg(test)]
+pub(crate) async fn migrate_object_replacing_stale_target(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    op_label: &str,
+    stale_target_etag: String,
+) -> Result<()> {
+    migrate_object_inner(store, pool_idx, bucket, rd, None, op_label, None, None, None, Some(stale_target_etag)).await
 }
 
 #[cfg(test)]
@@ -1629,6 +1729,7 @@ pub(crate) async fn migrate_object_with_lock_lost_signal(
         lock_lost_signal,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1644,6 +1745,7 @@ async fn migrate_object_inner(
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     capacity_owner: Option<DecommissionCapacityOwner>,
     mutation_fence: Option<DecommissionFixedReadAnchor>,
+    stale_target_overwrite: Option<String>,
 ) -> Result<()> {
     if scanner_backlog::is_scanner_pause_backlog(&bucket, &rd.object_info.name) {
         return Err(Error::other("scanner pause backlog requires native retirement handoff"));
@@ -1866,6 +1968,9 @@ async fn migrate_object_inner(
             if let Some(capacity_owner) = capacity_owner {
                 capacity_owner.apply_to(&mut complete_multipart_opts);
             }
+            if let Some(etag) = stale_target_overwrite.as_deref() {
+                complete_multipart_opts.http_preconditions = Some(data_movement_stale_target_overwrite_precondition(etag));
+            }
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
             if let Some(signal) = lock_lost_signal.as_ref() {
                 complete_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
@@ -2068,6 +2173,9 @@ async fn migrate_object_inner(
     let mut put_opts = data_movement_put_object_opts(&object_info, pool_idx);
     if let Some(capacity_owner) = capacity_owner {
         capacity_owner.apply_to(&mut put_opts);
+    }
+    if let Some(etag) = stale_target_overwrite.as_deref() {
+        put_opts.http_preconditions = Some(data_movement_stale_target_overwrite_precondition(etag));
     }
     put_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
     if let Some(signal) = lock_lost_signal {
@@ -4359,6 +4467,110 @@ mod tests {
             .expect("rebalance overwrite should evaluate a different target version");
 
         assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_stale_unversioned_target_requires_older_unversioned_live_copy_with_etag() {
+        let older = time::OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let newer = older + time::Duration::SECOND;
+        let source = ObjectInfo {
+            version_id: None,
+            mod_time: Some(newer),
+            etag: Some("etag-source".to_string()),
+            ..Default::default()
+        };
+        let stale_target = ObjectInfo {
+            mod_time: Some(older),
+            etag: Some("etag-target".to_string()),
+            ..source.clone()
+        };
+        assert!(is_stale_unversioned_data_movement_target(&source, &stale_target));
+        assert!(
+            is_stale_unversioned_data_movement_target(
+                &ObjectInfo {
+                    version_id: Some(Uuid::nil()),
+                    ..source.clone()
+                },
+                &ObjectInfo {
+                    version_id: Some(Uuid::nil()),
+                    ..stale_target.clone()
+                }
+            ),
+            "a nil version id is the unversioned representation"
+        );
+
+        // A target that is newer than, or as new as, the source is not stale:
+        // the superseding path owns that case.
+        assert!(!is_stale_unversioned_data_movement_target(
+            &source,
+            &ObjectInfo {
+                mod_time: Some(newer),
+                ..stale_target.clone()
+            }
+        ));
+        assert!(!is_stale_unversioned_data_movement_target(
+            &source,
+            &ObjectInfo {
+                mod_time: Some(newer + time::Duration::SECOND),
+                ..stale_target.clone()
+            }
+        ));
+        // Versioned copies are distinct versions, never replacements.
+        assert!(!is_stale_unversioned_data_movement_target(
+            &ObjectInfo {
+                version_id: Some(Uuid::new_v4()),
+                ..source.clone()
+            },
+            &stale_target
+        ));
+        assert!(!is_stale_unversioned_data_movement_target(
+            &source,
+            &ObjectInfo {
+                version_id: Some(Uuid::new_v4()),
+                ..stale_target.clone()
+            }
+        ));
+        // Delete markers and etag-less copies cannot be guarded by If-Match.
+        assert!(!is_stale_unversioned_data_movement_target(
+            &source,
+            &ObjectInfo {
+                delete_marker: true,
+                ..stale_target.clone()
+            }
+        ));
+        assert!(!is_stale_unversioned_data_movement_target(
+            &ObjectInfo {
+                delete_marker: true,
+                ..source.clone()
+            },
+            &stale_target
+        ));
+        assert!(!is_stale_unversioned_data_movement_target(
+            &source,
+            &ObjectInfo {
+                etag: None,
+                ..stale_target.clone()
+            }
+        ));
+        assert!(!is_stale_unversioned_data_movement_target(
+            &source,
+            &ObjectInfo {
+                etag: Some(String::new()),
+                ..stale_target.clone()
+            }
+        ));
+        // Unknown modification times never authorize a replacement.
+        assert!(!is_stale_unversioned_data_movement_target(
+            &ObjectInfo {
+                mod_time: None,
+                ..source.clone()
+            },
+            &stale_target
+        ));
+
+        let precondition = data_movement_stale_target_overwrite_precondition("etag-target");
+        assert_eq!(precondition.if_match_value(), Some("etag-target"));
+        assert_eq!(precondition.if_none_match_value(), None);
     }
 
     #[test]
