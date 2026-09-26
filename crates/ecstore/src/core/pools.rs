@@ -2248,6 +2248,58 @@ fn resolve_decommission_target_pending(
     Ok(())
 }
 
+/// Drop the pending target capacity intent still owned by `mutation_id`, on
+/// whichever target it was reserved.
+///
+/// A target write that is rejected by its precondition (`PreconditionFailed`)
+/// commits nothing, but the intent recorded for it in
+/// [`reserve_decommission_target_pending`] is deliberately kept alive: the
+/// caller may still prove the target already holds an equivalent object and
+/// reconcile the intent as consumed
+/// (`reconcile_decommission_capacity_after_equivalent_target`). When the entry
+/// is instead given up, nothing resolves the intent: every later mutation on
+/// that target carries a different `mutation_id` and is rejected with
+/// "unresolved target capacity intent" until the whole decommission is
+/// cancelled. This releases it. Returns whether the pool metadata changed;
+/// intents owned by other mutations are left untouched.
+fn release_decommission_mutation_pending_intent(
+    meta: &mut PoolMeta,
+    source_pool_index: usize,
+    mutation_id: uuid::Uuid,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let pool_count = meta.pools.len();
+    let pool = meta
+        .pools
+        .get_mut(source_pool_index)
+        .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
+    let Some(reservation) = pool
+        .decommission
+        .as_mut()
+        .and_then(|info| info.capacity_reservation.as_mut())
+        .filter(|reservation| reservation.active())
+    else {
+        return Ok(false);
+    };
+    let mut released = 0usize;
+    for target in reservation
+        .targets
+        .iter_mut()
+        .filter(|target| target.pending_physical_bytes > 0 && target.pending_mutation_id == Some(mutation_id))
+    {
+        released = released.saturating_add(target.pending_physical_bytes);
+        target.pending_physical_bytes = 0;
+        target.pending_mutation_id = None;
+    }
+    if released == 0 {
+        return Ok(false);
+    }
+    reservation.pending_target_physical_bytes = reservation.pending_target_physical_bytes.saturating_sub(released);
+    renew_decommission_capacity_reservation(reservation, now, true);
+    pool.last_update = pool.last_update.max(now);
+    Ok(true)
+}
+
 fn release_decommission_target_temporary_mutation(
     target: &mut DecommissionCapacityTarget,
     mutation_id: uuid::Uuid,
@@ -11490,6 +11542,59 @@ impl ECStore {
         Ok(())
     }
 
+    /// Release the pending target capacity intent a decommission entry left
+    /// behind when its target write was rejected by a precondition and the
+    /// entry is now given up (see [`release_decommission_mutation_pending_intent`]).
+    /// Returns whether an intent was released.
+    pub(crate) async fn release_decommission_unwritten_mutation_intent(
+        &self,
+        owner: DecommissionCapacityOwner,
+        mutation_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, mut snapshot) = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "decommission unwritten intent release failed")
+            .await?;
+        let source_pool_index = owner.source_pool_index;
+        let owner_current = snapshot
+            .pools
+            .get(source_pool_index)
+            .and_then(|pool| pool.decommission.as_ref())
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .is_some_and(|reservation| {
+                reservation.active()
+                    && reservation.source_pool_index == owner.source_pool_index
+                    && reservation.operation_id == owner.operation_id
+                    && reservation.generation == owner.generation
+                    && reservation.owner_nonce == owner.owner_nonce
+            });
+        if !owner_current {
+            // A stale owner has nothing of its own left to release; a later
+            // reservation must not be edited on its behalf.
+            return Ok(false);
+        }
+        let now = OffsetDateTime::now_utc();
+        if !release_decommission_mutation_pending_intent(&mut snapshot, source_pool_index, mutation_id, now)? {
+            return Ok(false);
+        }
+        let outcome = snapshot
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                pool_meta_guard.lock_lost_signal(),
+                &[source_pool_index],
+            )
+            .await?;
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission unwritten intent release save failed")?;
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, source_pool_index)?;
+        }
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission unwritten intent release save failed")?;
+        outcome.disarm();
+        Ok(true)
+    }
+
     pub(crate) async fn run_decommission_capacity_temporary_mutation<T, F, Fut>(
         &self,
         target_pool_index: usize,
@@ -15703,6 +15808,52 @@ impl ECStore {
 
                     failure = true;
                     if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                        // A precondition-rejected target write committed nothing,
+                        // but its capacity intent was kept alive for an
+                        // equivalent-target reconcile that never came. Giving the
+                        // entry up must release it, or every later object bound
+                        // for that target is rejected with "unresolved target
+                        // capacity intent" until the decommission is cancelled.
+                        let rejected_by_precondition = matches!(err, Error::PreconditionFailed)
+                            || matches!(
+                                data_movement::data_movement_stage_source(&err),
+                                Some(Error::PreconditionFailed)
+                            );
+                        if rejected_by_precondition && let Some(owner) = capacity_owner {
+                            let mutation_id = decommission_capacity_version_mutation_id(owner, &bucket_name, version);
+                            match self.release_decommission_unwritten_mutation_intent(owner, mutation_id).await {
+                                Ok(released) => {
+                                    if released {
+                                        warn!(
+                                            event = EVENT_DECOMMISSION_ENTRY,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_POOLS,
+                                            state = "unwritten_capacity_intent_released",
+                                            pool_index = idx,
+                                            bucket = %bucket_name,
+                                            object = %object_name,
+                                            version = %version.name,
+                                            mutation_id = %mutation_id,
+                                            "Released the target capacity intent of a precondition-rejected migration"
+                                        );
+                                    }
+                                }
+                                Err(release_err) => {
+                                    error!(
+                                        event = EVENT_DECOMMISSION_ENTRY,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_POOLS,
+                                        state = "unwritten_capacity_intent_release_failed",
+                                        pool_index = idx,
+                                        bucket = %bucket_name,
+                                        object = %object_name,
+                                        version = %version.name,
+                                        error = ?release_err,
+                                        "Could not release the target capacity intent of a precondition-rejected migration"
+                                    );
+                                }
+                            }
+                        }
                         error!(
                             event = EVENT_DECOMMISSION_ENTRY,
                             component = LOG_COMPONENT_ECSTORE,
@@ -20175,6 +20326,92 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn decommission_given_up_precondition_failure_does_not_wedge_later_mutations() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 20, 100, 80),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 200, 200, 0),
+        ];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity]);
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate a reservation for the source pool");
+        let base_owner = {
+            let meta = store.pool_meta.read().await;
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the source must own an active reservation");
+            DecommissionCapacityOwner {
+                source_pool_index: 0,
+                operation_id: reservation.operation_id,
+                generation: reservation.generation,
+                owner_nonce: reservation.owner_nonce,
+                mutation_id: None,
+            }
+        };
+        let pending_bytes = |meta: &PoolMeta| {
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the reservation should stay active")
+                .pending_target_physical_bytes
+        };
+
+        // The first object's target write is rejected by its `If-None-Match: *`
+        // guard. The intent is deliberately kept: the caller may still prove the
+        // target equivalent and reconcile it as consumed.
+        let rejected_mutation_id = uuid::Uuid::new_v4();
+        let rejected_owner = base_owner.with_mutation_id(rejected_mutation_id);
+        let err = store
+            .run_decommission_capacity_admitted_mutation(1, Some(rejected_owner), Some(17), || async {
+                Err::<(), _>(Error::PreconditionFailed)
+            })
+            .await
+            .expect_err("the rejected target write must surface its precondition failure");
+        assert!(matches!(err, Error::PreconditionFailed), "unexpected error: {err:?}");
+        assert!(
+            pending_bytes(&*store.pool_meta.read().await) > 0,
+            "the intent must survive the rejection for an equivalent-target reconcile"
+        );
+
+        // Nobody reconciles it: the entry is given up. Without the release every
+        // later mutation on the target is rejected as an intent conflict.
+        let next_owner = base_owner.with_mutation_id(uuid::Uuid::new_v4());
+        let blocked = store
+            .run_decommission_capacity_admitted_mutation(1, Some(next_owner), Some(17), || async { Ok(()) })
+            .await
+            .expect_err("an orphaned intent still blocks other mutations until it is released");
+        assert!(is_decommission_capacity_intent_conflict(&blocked), "unexpected error: {blocked:?}");
+
+        assert!(
+            store
+                .release_decommission_unwritten_mutation_intent(rejected_owner, rejected_mutation_id)
+                .await
+                .expect("releasing the given-up mutation's intent must succeed"),
+            "the orphaned intent must be reported as released"
+        );
+        assert_eq!(pending_bytes(&*store.pool_meta.read().await), 0);
+        assert!(
+            !store
+                .release_decommission_unwritten_mutation_intent(rejected_owner, rejected_mutation_id)
+                .await
+                .expect("a second release is a no-op")
+        );
+
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(next_owner), Some(17), || async { Ok(()) })
+            .await
+            .expect("a later mutation must be admitted once the orphaned intent is released");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn decommission_capacity_publication_allows_immediate_bucket_completion() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
@@ -24021,8 +24258,9 @@ mod pools_tests {
         decommission_capacity_target_gate_retry_exhausted, ensure_decommission_target_owner_admission,
         ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
         is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
-        record_decommission_target_consumption, release_decommission_target_inflight, reserve_decommission_target_pending,
-        resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
+        record_decommission_target_consumption, release_decommission_mutation_pending_intent,
+        release_decommission_target_inflight, reserve_decommission_target_pending, resolve_decommission_target_pending,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -29750,6 +29988,78 @@ mod pools_tests {
                 .pending_target_physical_bytes,
             10
         );
+    }
+
+    #[test]
+    fn decommission_mutation_pending_intent_release_is_scoped_to_its_owner() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(2);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let initial = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+        ];
+        let mut meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        meta.decommission(0, initial[0].space).unwrap();
+        reserve_decommission_start_target_capacity(
+            &mut meta,
+            &[0],
+            &initial,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("the initial target capacity should fit exactly");
+        let pending_bytes = |meta: &PoolMeta| {
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the reservation should remain present")
+                .pending_target_physical_bytes
+        };
+
+        let rejected_mutation_id = uuid::Uuid::from_u128(1);
+        let next_mutation_id = uuid::Uuid::from_u128(2);
+        reserve_decommission_target_pending(&mut meta, 0, 1, 10, rejected_mutation_id, now + Duration::seconds(1))
+            .expect("the first mutation should persist its target intent");
+        assert_eq!(pending_bytes(&meta), 10);
+
+        assert!(
+            !release_decommission_mutation_pending_intent(&mut meta, 0, next_mutation_id, now + Duration::seconds(2))
+                .expect("a foreign mutation id is a no-op"),
+            "an intent owned by another mutation must never be released on its behalf"
+        );
+        assert_eq!(pending_bytes(&meta), 10);
+
+        assert!(
+            release_decommission_mutation_pending_intent(&mut meta, 0, rejected_mutation_id, now + Duration::seconds(2))
+                .expect("the given-up mutation should release its own intent"),
+            "releasing the intent must report a metadata change"
+        );
+        assert_eq!(pending_bytes(&meta), 0);
+        assert!(
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the reservation should remain present")
+                .targets
+                .iter()
+                .all(|target| target.pending_mutation_id.is_none() && target.pending_physical_bytes == 0)
+        );
+        assert!(
+            !release_decommission_mutation_pending_intent(&mut meta, 0, rejected_mutation_id, now + Duration::seconds(3))
+                .expect("releasing twice is a no-op")
+        );
+
+        reserve_decommission_target_pending(&mut meta, 0, 1, 10, next_mutation_id, now + Duration::seconds(3))
+            .expect("the next mutation must be admitted once the orphaned intent is gone");
+        assert_eq!(pending_bytes(&meta), 10);
     }
 
     #[test]
