@@ -19370,25 +19370,33 @@ mod tests {
             store.pools[0].get_disks_by_key(conflict_object),
         ))
         .await
-        .expect("entry must record a real conditional-copy failure");
+        .expect("a lookalike name is an ordinary object: its older target copy is replaced");
         let meta = store.pool_meta.read().await;
         let info = meta.pools[0].decommission.as_ref().expect("final progress");
-        assert_eq!(info.items_decommissioned, controls.len());
+        // The conflict object is not a set-local cache, so it migrates like any
+        // other unversioned object: the target's older, unreachable copy is
+        // replaced under `If-Match` and the entry counts as decommissioned.
+        // Only the injected source read failure remains a failure — similar
+        // names must neither hide it nor be mistaken for set-local caches.
+        assert_eq!(info.items_decommissioned, controls.len() + 1);
         assert_eq!(
-            info.items_decommission_failed, 2,
-            "similar names must not hide read or migration failures"
+            info.items_decommission_failed, 1,
+            "similar names must not hide read failures"
         );
-        assert_eq!(info.bytes_failed, source_body.len() * 2);
+        assert_eq!(info.bytes_failed, source_body.len());
         drop(meta);
-        for (pool_index, expected) in [(0, source_body.as_slice()), (1, target_body.as_slice())] {
-            let mut reader = store.pools[pool_index]
-                .get_object_reader(RUSTFS_META_BUCKET, conflict_object, None, HeaderMap::new(), &ObjectOptions::default())
-                .await
-                .expect("failed migration must preserve both objects");
-            let mut actual = Vec::new();
-            reader.stream.read_to_end(&mut actual).await.expect("read conflict object");
-            assert_eq!(actual, expected);
-        }
+        let mut reader = store.pools[1]
+            .get_object_reader(RUSTFS_META_BUCKET, conflict_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer source must replace the older target copy");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read replaced conflict object");
+        assert_eq!(actual, source_body);
+        let err = store.pools[0]
+            .get_object_info(RUSTFS_META_BUCKET, conflict_object, &ObjectOptions::default())
+            .await
+            .expect_err("the migrated conflict object must leave the source pool");
+        assert!(is_err_object_not_found(&err), "{conflict_object}: {err:?}");
     }
 
     #[tokio::test]
