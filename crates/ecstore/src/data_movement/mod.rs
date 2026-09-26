@@ -1040,7 +1040,7 @@ pub(crate) async fn stale_unversioned_target_overwrite_etag(
         if target_pool_idx == src_pool_idx || is_suspended {
             continue;
         }
-        if let Some(target) = find_data_movement_target_info(store, target_pool_idx, bucket, source).await?
+        if let Some(target) = Box::pin(find_data_movement_target_info(store, target_pool_idx, bucket, source)).await?
             && is_stale_unversioned_data_movement_target(source, &target)
         {
             return Ok(target.etag);
