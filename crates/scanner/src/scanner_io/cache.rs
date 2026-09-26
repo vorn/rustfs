@@ -97,7 +97,13 @@ where
         );
     }
 
-    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
+    // The persisted scanner cycle fence is a cluster-global meta object; it
+    // physically lives only in the pool that owns the meta-bucket object.
+    // Validating it through the caller's set-scoped store would read
+    // ConfigNotFound on every other pool and fail every checkpoint, so the
+    // fence must be read through the resolved global object store (the same
+    // view the request-admission check uses).
+    if crate::remote_scanner::validate_remote_scanner_request_fence_exact(context.cycle, context.leader_epoch)
         .await
         .is_err()
     {
@@ -117,7 +123,7 @@ where
         return ScannerCheckpointPersistResult::Failed(error);
     }
 
-    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
+    if crate::remote_scanner::validate_remote_scanner_request_fence_exact(context.cycle, context.leader_epoch)
         .await
         .is_err()
         || scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)

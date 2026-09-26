@@ -125,6 +125,22 @@ pub async fn validate_remote_scanner_request_fence(
     .await
 }
 
+/// Validate the scanner cycle fence against a fresh read of the persisted
+/// state through the resolved global object store. Unlike the cached watcher
+/// variant this never serves a TTL-stale answer, and unlike the store-taking
+/// variant it never reads through a set-scoped store where the global fence
+/// object is not physically resident (which would decode as `(0, 0)` and fail
+/// every checkpoint on a non-first pool).
+pub(crate) async fn validate_remote_scanner_request_fence_exact(
+    requested_cycle: u64,
+    requested_leader_epoch: u64,
+) -> Result<(), ScannerError> {
+    let store = resolve_scanner_object_store_handle()
+        .ok_or_else(|| ScannerError::Other("remote namespace scanner object layer is unavailable".to_string()))?;
+    validate_remote_scanner_request_fence_with_store(requested_cycle, requested_leader_epoch, store)
+        .await
+        .map(|_| ())
+}
 async fn validate_remote_scanner_request_fence_cached(
     requested_cycle: u64,
     requested_leader_epoch: u64,
