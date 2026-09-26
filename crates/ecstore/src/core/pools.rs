@@ -15831,12 +15831,14 @@ impl ECStore {
                     // the entry; the retry does not consume a copy attempt.
                     if !stale_target_checked && is_decommission_target_precondition_failure(&err) {
                         stale_target_checked = true;
-                        match data_movement::stale_unversioned_target_overwrite_etag(
+                        // Boxed: the per-entry future is already large and this
+                        // lookup nests a full object-info read per pool.
+                        match Box::pin(data_movement::stale_unversioned_target_overwrite_etag(
                             self.as_ref(),
                             idx,
                             bucket_name.as_str(),
                             &source_info,
-                        )
+                        ))
                         .await
                         {
                             Ok(Some(etag)) => {
