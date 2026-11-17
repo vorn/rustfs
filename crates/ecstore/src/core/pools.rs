@@ -14089,7 +14089,7 @@ impl ECStore {
         owner: DecommissionCapacityOwner,
         mutation_id: uuid::Uuid,
     ) -> Result<bool> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission unwritten intent release failed")
             .await?;
@@ -14119,7 +14119,7 @@ impl ECStore {
             .save_no_lock_armed(
                 self.pools.clone(),
                 &mut save_guard,
-                pool_meta_guard.lock_lost_signal(),
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
                 &[source_pool_index],
             )
             .await?;

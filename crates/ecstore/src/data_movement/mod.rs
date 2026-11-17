@@ -1953,7 +1953,9 @@ pub(crate) async fn migrate_object_replacing_stale_target(
     op_label: &str,
     stale_target_etag: String,
 ) -> Result<()> {
-    migrate_object_inner(store, pool_idx, bucket, rd, None, op_label, None, None, None, Some(stale_target_etag)).await
+    migrate_object_inner(store, pool_idx, bucket, rd, None, op_label, None, None, None, Some(stale_target_etag))
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
